@@ -80,3 +80,14 @@ temp/
 dist/
 build/
 *.egg-info/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# Qdrant storage
+qdrant_storage/
