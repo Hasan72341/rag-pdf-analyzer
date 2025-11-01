@@ -30,6 +30,7 @@ A full-stack application for analyzing PDF documents using RAG (Retrieval-Augmen
 - Python 3.8+
 - Node.js 16+
 - NVIDIA API key
+ - Qdrant running locally or accessible via URL (default: http://localhost:6333)
 
 ## Setup
 
@@ -41,7 +42,11 @@ pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
-# Edit .env and add your NVIDIA_API_KEY
+# Edit .env and add your NVIDIA_API_KEY and (optional) QDRANT_URL
+# Example .env entries:
+# OPENAI_API_KEY=sk-...
+# OPENAI_API_BASE=https://api.example.com
+# QDRANT_URL=http://localhost:6333
 ```
 
 ### 2. Frontend Setup
@@ -52,6 +57,11 @@ cd frontend
 
 # Install dependencies
 npm install
+
+# To point the frontend to the backend during development, set VITE_API_BASE in
+# a `.env` file inside the `frontend/` folder (Vite uses VITE_ prefix):
+# Example (frontend/.env):
+# VITE_API_BASE=http://localhost:8000
 ```
 
 ## Running the Application

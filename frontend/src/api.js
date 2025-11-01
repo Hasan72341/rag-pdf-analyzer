@@ -1,6 +1,7 @@
 import axios from 'axios';
 
-const API_BASE_URL = '/api';
+// Allow overriding the API base URL via environment variable set by Vite
+const API_BASE_URL = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 
 export const healthCheck = async () => {
   const response = await axios.get(`${API_BASE_URL}/health`);
@@ -28,5 +29,9 @@ export const queryDocuments = async (question) => {
 
 export const listDocuments = async () => {
   const response = await axios.get(`${API_BASE_URL}/documents`);
-  return response.data;
+  // normalize to an array of filenames
+  const data = response.data || {};
+  if (Array.isArray(data.documents)) return data.documents;
+  // older backend returned total_chunks and collection_name
+  return [];
 };

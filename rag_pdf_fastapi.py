@@ -1,7 +1,10 @@
 import os
 import io
 import uuid
-from typing import List, Optional
+import logging
+import sys
+from typing import List, Optional, Dict, Any, Set
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,6 +19,8 @@ from PyPDF2 import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from openai import OpenAI
+import sqlite3
+from datetime import datetime
 
 load_dotenv()
 
@@ -63,10 +68,13 @@ class NVIDIAEmbeddings(Embeddings):
 
 class RAGPDFAnalyzer:
     def __init__(self):
+        self._configure_logging()
         self._init_embeddings()
         self._init_llm()
         self._init_text_splitter()
         self._init_qdrant()
+        # track uploaded document filenames
+        self.documents: Set[str] = set()
     
     def _init_embeddings(self):
         self.embeddings = NVIDIAEmbeddings(
@@ -91,7 +99,8 @@ class RAGPDFAnalyzer:
         )
         
     def _init_qdrant(self):
-        self.qdrant_client = QdrantClient(url="http://localhost:6333")
+        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        self.qdrant_client = QdrantClient(url=qdrant_url)
         self.collection_name = "pdf_documents"
         
         try:
@@ -101,16 +110,41 @@ class RAGPDFAnalyzer:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=1024, distance=Distance.COSINE)
             )
+        # initialize sqlite metadata DB
+        self._init_metadata_db()
+
+    def _init_metadata_db(self) -> None:
+        db_path = os.getenv("METADATA_DB", "./documents_meta.db")
+        self._db_conn = sqlite3.connect(db_path, check_same_thread=False)
+        cur = self._db_conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                filename TEXT PRIMARY KEY,
+                chunks INTEGER,
+                uploaded_at TEXT
+            )
+            """
+        )
+        self._db_conn.commit()
     
     def extract_text_from_pdf(self, pdf_content: bytes, filename: str) -> str:
         pdf_reader = PdfReader(io.BytesIO(pdf_content))
         text = ""
         for page in pdf_reader.pages:
-            text += page.extract_text()
+            try:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+            except Exception as e:
+                logging.exception("Error extracting text from page in %s: %s", filename, e)
         return text
     
     def process_and_store_pdf(self, pdf_content: bytes, filename: str) -> dict:
         text = self.extract_text_from_pdf(pdf_content, filename)
+        if not text.strip():
+            raise ValueError("No extractable text found in PDF")
+
         chunks = self.text_splitter.split_text(text)
         
         documents = []
@@ -125,15 +159,29 @@ class RAGPDFAnalyzer:
                 }
             )
             documents.append(doc)
-        
+        # When adding documents to Qdrant we include simple payload data so
+        # we can list documents later. Langchain's Qdrant wrapper will map
+        # metadata into payloads.
         vectorstore = Qdrant(
             client=self.qdrant_client,
             collection_name=self.collection_name,
             embeddings=self.embeddings
         )
-        
+
         vectorstore.add_documents(documents)
-        
+        # record document in-memory
+        self.documents.add(filename)
+        # persist metadata
+        try:
+            cur = self._db_conn.cursor()
+            cur.execute(
+                "REPLACE INTO documents (filename, chunks, uploaded_at) VALUES (?, ?, ?)",
+                (filename, len(chunks), datetime.utcnow().isoformat()),
+            )
+            self._db_conn.commit()
+        except Exception:
+            logging.exception("Failed to persist metadata for %s", filename)
+
         return {
             "success": True,
             "chunks_created": len(chunks),
@@ -154,10 +202,14 @@ class RAGPDFAnalyzer:
             return_source_documents=True
         )
         
-        result = qa_chain.invoke({"query": question})
+        try:
+            result = qa_chain.invoke({"query": question})
+        except Exception as e:
+            logging.exception("Error running QA chain for question: %s", question)
+            raise
         
         sources = []
-        for doc in result["source_documents"]:
+        for doc in result.get("source_documents", []):
             source_info = {
                 "source": doc.metadata.get("source", "Unknown"),
                 "chunk_id": doc.metadata.get("chunk_id", 0),
@@ -167,7 +219,7 @@ class RAGPDFAnalyzer:
             sources.append(source_info)
         
         return {
-            "answer": result["result"],
+            "answer": result.get("result", ""),
             "sources": sources
         }
     
@@ -175,11 +227,35 @@ class RAGPDFAnalyzer:
         try:
             info = self.qdrant_client.get_collection(self.collection_name)
             return {
-                "total_documents": info.points_count,
+                "total_documents": getattr(info, "points_count", 0),
                 "collection_name": self.collection_name
             }
         except:
             return {"total_documents": 0, "collection_name": self.collection_name}
+
+    def list_documents(self) -> List[str]:
+        """Return a list of unique document filenames stored in the collection.
+
+        This queries Qdrant payloads for the `source` field and falls back to
+        the in-memory set when Qdrant is unavailable.
+        """
+        try:
+            cur = self._db_conn.cursor()
+            cur.execute("SELECT filename FROM documents ORDER BY uploaded_at DESC")
+            rows = cur.fetchall()
+            return [r[0] for r in rows]
+        except Exception:
+            logging.exception("Failed to read metadata DB, falling back to memory")
+            return list(self.documents)
+
+    def _configure_logging(self) -> None:
+        # Basic logging configuration
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+            stream=sys.stdout,
+        )
+        logging.getLogger("uvicorn").setLevel(logging.INFO)
 
 @app.on_event("startup")
 async def startup_event():
@@ -254,15 +330,39 @@ async def query_documents(request: QueryRequest):
 @app.get("/documents")
 async def get_documents_info():
     info = g_analyzer.get_collection_info()
+    documents = g_analyzer.list_documents() if g_analyzer else []
     return {
+        "documents": documents,
         "total_chunks": info["total_documents"],
         "collection_name": info["collection_name"]
     }
 
 @app.delete("/documents")
 async def clear_documents():
-    g_analyzer.qdrant_client.delete_collection(g_analyzer.collection_name)
-    return {"message": "All documents cleared successfully"}
+    # Delete collection and recreate an empty one to ensure the service stays
+    # usable after clearing. Also clear the in-memory tracking.
+    try:
+        g_analyzer.qdrant_client.delete_collection(g_analyzer.collection_name)
+    except Exception:
+        # ignore if already removed
+        pass
+
+    # recreate collection
+    g_analyzer.qdrant_client.create_collection(
+        collection_name=g_analyzer.collection_name,
+        vectors_config=VectorParams(size=1024, distance=Distance.COSINE)
+    )
+
+    g_analyzer.documents.clear()
+    # clear metadata DB
+    try:
+        cur = g_analyzer._db_conn.cursor()
+        cur.execute("DELETE FROM documents")
+        g_analyzer._db_conn.commit()
+    except Exception:
+        logging.exception("Failed to clear metadata DB")
+
+    return {"message": "All documents cleared successfully", "documents": []}
 
 app.add_middleware(
     CORSMiddleware,

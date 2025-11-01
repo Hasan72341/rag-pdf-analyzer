@@ -30,8 +30,8 @@ function App() {
 
   const loadDocuments = async () => {
     try {
-      const data = await listDocuments();
-      setDocuments(data.documents || []);
+      const docs = await listDocuments();
+      setDocuments(docs || []);
     } catch (error) {
       console.error('Failed to load documents:', error);
     }
@@ -59,7 +59,7 @@ function App() {
 
     try {
       const data = await uploadPDF(selectedFile);
-      setUploadMessage(`Success! Uploaded ${data.chunks_added} chunks from ${data.filename}`);
+      setUploadMessage(`Success! Uploaded ${data.chunks_created} chunks from ${data.filename}`);
       setSelectedFile(null);
       document.getElementById('fileInput').value = '';
       await loadDocuments();
@@ -81,7 +81,7 @@ function App() {
 
     try {
       const data = await queryDocuments(question);
-      setAnswer(data.answer);
+      setAnswer(data.answer || 'No answer returned');
     } catch (error) {
       setAnswer(`Error: ${error.response?.data?.detail || error.message}`);
     } finally {
@@ -104,7 +104,7 @@ function App() {
           {health ? (
             <span className={`status-badge ${health.status}`}>
               {health.status === 'healthy' ? '✓' : '✗'} {health.status}
-              {health.document_count !== undefined && ` · ${health.document_count} docs`}
+              {health.documents_stored !== undefined && ` · ${health.documents_stored} docs`}
             </span>
           ) : (
             <span className="status-badge loading">Loading...</span>
